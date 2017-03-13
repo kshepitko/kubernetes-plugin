@@ -24,6 +24,16 @@
 
 package org.csanchez.jenkins.plugins.kubernetes.pipeline;
 
+import static org.csanchez.jenkins.plugins.kubernetes.KubernetesTestUtil.*;
+import static org.junit.Assert.*;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.logging.Level;
+
 import org.apache.commons.compress.utils.IOUtils;
 import org.csanchez.jenkins.plugins.kubernetes.ContainerTemplate;
 import org.csanchez.jenkins.plugins.kubernetes.KubernetesCloud;
@@ -43,23 +53,15 @@ import org.jvnet.hudson.test.JenkinsRuleNonLocalhost;
 import org.jvnet.hudson.test.LoggerRule;
 import org.jvnet.hudson.test.RestartableJenkinsRule;
 
-import java.net.InetAddress;
-import java.net.URL;
-import java.util.Collections;
-import java.util.logging.Level;
+import com.google.common.io.Resources;
 
 import hudson.model.Node;
-import hudson.model.Run;
 import hudson.slaves.DumbSlave;
 import hudson.slaves.NodeProperty;
 import hudson.slaves.RetentionStrategy;
 import io.fabric8.kubernetes.api.model.NamespaceBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import jenkins.model.JenkinsLocationConfiguration;
-
-import static org.csanchez.jenkins.plugins.kubernetes.KubernetesTestUtil.assumeMiniKube;
-import static org.csanchez.jenkins.plugins.kubernetes.KubernetesTestUtil.miniKubeUrl;
-import static org.junit.Assert.assertNotNull;
 /**
  * @author Carlos Sanchez
  */
@@ -131,8 +133,18 @@ public class KubernetesPipelineTest {
     public void runInPod() throws Exception {
         configureCloud(r);
         WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
-        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runInPod.groovy")
-                , true));
+        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runInPod.groovy"), true));
+        WorkflowRun b = p.scheduleBuild2(0).waitForStart();
+        assertNotNull(b);
+        r.assertBuildStatusSuccess(r.waitForCompletion(b));
+        r.assertLogContains("pwd is -/home/jenkins/workspace/p with spaces-", b);
+    }
+
+    @Test
+    public void runInPodWithMultipleContainers() throws Exception {
+        configureCloud(r);
+        WorkflowJob p = r.jenkins.createProject(WorkflowJob.class, "p");
+        p.setDefinition(new CpsFlowDefinition(loadPipelineScript("runInPodWithMultipleContainers.groovy"), true));
         WorkflowRun b = p.scheduleBuild2(0).waitForStart();
         assertNotNull(b);
         r.assertBuildStatusSuccess(r.waitForCompletion(b));
