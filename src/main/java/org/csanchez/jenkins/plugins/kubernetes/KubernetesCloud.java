@@ -1,37 +1,5 @@
 package org.csanchez.jenkins.plugins.kubernetes;
 
-import java.io.IOException;
-import java.net.URL;
-import java.nio.file.Paths;
-import java.security.KeyStoreException;
-import java.security.NoSuchAlgorithmException;
-import java.security.UnrecoverableKeyException;
-import java.security.cert.CertificateEncodingException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.Callable;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-
-import javax.annotation.CheckForNull;
-import javax.annotation.Nonnull;
-
-import hudson.model.labels.LabelAtom;
-import org.apache.commons.lang.StringUtils;
-import org.csanchez.jenkins.plugins.kubernetes.pipeline.PodTemplateStepExecution;
-import org.csanchez.jenkins.plugins.kubernetes.volumes.PodVolume;
-import org.kohsuke.stapler.DataBoundConstructor;
-import org.kohsuke.stapler.DataBoundSetter;
-import org.kohsuke.stapler.QueryParameter;
-
 import com.cloudbees.plugins.credentials.CredentialsMatchers;
 import com.cloudbees.plugins.credentials.CredentialsProvider;
 import com.cloudbees.plugins.credentials.common.StandardCertificateCredentials;
@@ -39,12 +7,14 @@ import com.cloudbees.plugins.credentials.common.StandardCredentials;
 import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
 import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
 import com.cloudbees.plugins.credentials.domains.URIRequirementBuilder;
+import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicate;
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
-
+import com.google.common.collect.Iterables;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Extension;
 import hudson.Util;
@@ -52,6 +22,8 @@ import hudson.model.Computer;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.Slave;
+import hudson.model.labels.LabelAtom;
 import hudson.security.ACL;
 import hudson.slaves.Cloud;
 import hudson.slaves.CloudRetentionStrategy;
@@ -74,8 +46,41 @@ import io.fabric8.kubernetes.api.model.VolumeMount;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import jenkins.model.Jenkins;
 import jenkins.model.JenkinsLocationConfiguration;
-import static org.csanchez.jenkins.plugins.kubernetes.PodTemplateUtils.substituteEnv;
+import org.apache.commons.lang.StringUtils;
+import org.csanchez.jenkins.plugins.kubernetes.pipeline.PodTemplateStepExecution;
+import org.csanchez.jenkins.plugins.kubernetes.strategies.AutoCreatedSlaveRetentionStrategy;
+import org.csanchez.jenkins.plugins.kubernetes.volumes.PodVolume;
 import org.jenkinsci.plugins.durabletask.executors.OnceRetentionStrategy;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
+import org.kohsuke.stapler.QueryParameter;
+
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.net.URL;
+import java.nio.file.Paths;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.UnrecoverableKeyException;
+import java.security.cert.CertificateEncodingException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static org.csanchez.jenkins.plugins.kubernetes.PodTemplateUtils.substituteEnv;
 
 /**
  * Kubernetes cloud provider.
@@ -302,26 +307,8 @@ public class KubernetesCloud extends Cloud {
         return "jenkins/" + label.getName();
     }
 
-
-    private Container createContainer(KubernetesSlave slave, ContainerTemplate containerTemplate, Collection<PodEnvVar> globalEnvVars, Collection<VolumeMount> volumeMounts) {
+    private Container createContainer(ContainerTemplate containerTemplate, Collection<PodEnvVar> globalEnvVars, Collection<VolumeMount> volumeMounts) {
         List<EnvVar> env = new ArrayList<EnvVar>(3);
-        // always add some env vars
-        env.add(new EnvVar("JENKINS_SECRET", slave.getComputer().getJnlpMac(), null));
-        env.add(new EnvVar("JENKINS_NAME", slave.getComputer().getName(), null));
-        JenkinsLocationConfiguration locationConfiguration = JenkinsLocationConfiguration.get();
-        String locationConfigurationUrl = locationConfiguration != null ? locationConfiguration.getUrl() : null;
-        env.add(new EnvVar("JENKINS_LOCATION_URL", locationConfigurationUrl, null));
-        String url = StringUtils.isBlank(jenkinsUrl) ? locationConfigurationUrl : jenkinsUrl;
-        env.add(new EnvVar("JENKINS_URL", url, null));
-        if (!StringUtils.isBlank(jenkinsTunnel)) {
-            env.add(new EnvVar("JENKINS_TUNNEL", jenkinsTunnel, null));
-        }
-
-        if (url == null) {
-            throw new IllegalStateException("Jenkins URL is null while computing JNLP url");
-        }
-        url = url.endsWith("/") ? url : url + "/";
-        env.add(new EnvVar("JENKINS_JNLP_URL", url + slave.getComputer().getUrl() + "slave-agent.jnlp", null));
 
         if (globalEnvVars != null) {
             for (PodEnvVar podEnvVar : globalEnvVars) {
@@ -339,9 +326,7 @@ public class KubernetesCloud extends Cloud {
         env.add(new EnvVar("HOME", containerTemplate.getWorkingDir(), null));
 
         List<String> arguments = Strings.isNullOrEmpty(containerTemplate.getArgs()) ? Collections.emptyList()
-                : parseDockerCommand(containerTemplate.getArgs() //
-                        .replaceAll(JNLPMAC_REF, slave.getComputer().getJnlpMac()) //
-                        .replaceAll(NAME_REF, slave.getComputer().getName()));
+                : parseDockerCommand(containerTemplate.getArgs());
 
 
         List<VolumeMount> containerMounts = new ArrayList<>(volumeMounts);
@@ -355,7 +340,7 @@ public class KubernetesCloud extends Cloud {
                 .withImage(substituteEnv(containerTemplate.getImage()))
                 .withImagePullPolicy(containerTemplate.isAlwaysPullImage() ? "Always" : "IfNotPresent")
                 .withNewSecurityContext()
-                    .withPrivileged(containerTemplate.isPrivileged())
+                .withPrivileged(containerTemplate.isPrivileged())
                 .endSecurityContext()
                 .withWorkingDir(substituteEnv(containerTemplate.getWorkingDir()))
                 .withVolumeMounts(containerMounts.toArray(new VolumeMount[containerMounts.size()]))
@@ -364,14 +349,34 @@ public class KubernetesCloud extends Cloud {
                 .withArgs(arguments)
                 .withTty(containerTemplate.isTtyEnabled())
                 .withNewResources()
-                    .withRequests(getResourcesMap(containerTemplate.getResourceRequestMemory(), containerTemplate.getResourceRequestCpu()))
-                    .withLimits(getResourcesMap(containerTemplate.getResourceLimitMemory(), containerTemplate.getResourceLimitCpu()))
+                .withRequests(getResourcesMap(containerTemplate.getResourceRequestMemory(), containerTemplate.getResourceRequestCpu()))
+                .withLimits(getResourcesMap(containerTemplate.getResourceLimitMemory(), containerTemplate.getResourceLimitCpu()))
                 .endResources()
                 .build();
     }
 
+    private void addJenkinsEnvVars(KubernetesSlave slave, List<EnvVar> env) {
+        // always add some env vars
+        env.add(new EnvVar("JENKINS_SECRET", slave.getComputer().getJnlpMac(), null));
+        env.add(new EnvVar("JENKINS_NAME", slave.getComputer().getName(), null));
+        JenkinsLocationConfiguration locationConfiguration = JenkinsLocationConfiguration.get();
+        String locationConfigurationUrl = locationConfiguration != null ? locationConfiguration.getUrl() : null;
+        env.add(new EnvVar("JENKINS_LOCATION_URL", locationConfigurationUrl, null));
+        String url = StringUtils.isBlank(jenkinsUrl) ? locationConfigurationUrl : jenkinsUrl;
+        env.add(new EnvVar("JENKINS_URL", url, null));
+        if (!StringUtils.isBlank(jenkinsTunnel)) {
+            env.add(new EnvVar("JENKINS_TUNNEL", jenkinsTunnel, null));
+        }
 
-    private Pod getPodTemplate(KubernetesSlave slave, Label label) {
+        if (url == null) {
+            throw new IllegalStateException("Jenkins URL is null while computing JNLP url");
+        }
+        url = url.endsWith("/") ? url : url + "/";
+        env.add(new EnvVar("JENKINS_JNLP_URL", url + slave.getComputer().getUrl() + "slave-agent.jnlp", null));
+    }
+
+
+    private Pod getPodTemplate(String slaveName, Label label) {
         final PodTemplate template = PodTemplateUtils.unwrap(getTemplate(label), templates);
         if (template == null) {
             return null;
@@ -397,19 +402,19 @@ public class KubernetesCloud extends Cloud {
         Map<String, Container> containers = new HashMap<>();
 
         for (ContainerTemplate containerTemplate : template.getContainers()) {
-            containers.put(containerTemplate.getName(), createContainer(slave, containerTemplate, template.getEnvVars(), volumeMounts.values()));
+            containers.put(containerTemplate.getName(), createContainer(containerTemplate, template.getEnvVars(), volumeMounts.values()));
         }
 
-        if (!containers.containsKey(JNLP_NAME)) {
-            ContainerTemplate containerTemplate = new ContainerTemplate(DEFAULT_JNLP_IMAGE);
-            containerTemplate.setName(JNLP_NAME);
-            containerTemplate.setArgs(DEFAULT_JNLP_ARGUMENTS);
-            containers.put(JNLP_NAME, createContainer(slave, containerTemplate, template.getEnvVars(), volumeMounts.values()));
-        }
+//        if (!containers.containsKey(JNLP_NAME)) {
+//            ContainerTemplate containerTemplate = new ContainerTemplate(DEFAULT_JNLP_IMAGE);
+//            containerTemplate.setName(JNLP_NAME);
+//            containerTemplate.setArgs(DEFAULT_JNLP_ARGUMENTS);
+//            containers.put(JNLP_NAME, createContainer(containerTemplate, template.getEnvVars(), volumeMounts.values()));
+//        }
 
         return new PodBuilder()
                 .withNewMetadata()
-                    .withName(substituteEnv(slave.getNodeName()))
+                    .withName(substituteEnv(slaveName))
                     .withLabels(getLabelsMap(template.getLabelSet()))
                     .withAnnotations(getAnnotationsMap(template.getAnnotations()))
                 .endMetadata()
@@ -508,17 +513,23 @@ public class KubernetesCloud extends Cloud {
 
             ArrayList<PodTemplate> templates = getMatchingTemplates(label);
 
+            boolean shouldAddAtLeastOneSlave = false;
+
             for (PodTemplate t: templates) {
                 for (int i = 1; i <= excessWorkload; i++) {
                     if (!addProvisionedSlave(t, label)) {
                         break;
                     }
+                    shouldAddAtLeastOneSlave = true;
 
-                    r.add(new NodeProvisioner.PlannedNode(t.getDisplayName(), Computer.threadPoolForRemoting
+//                    if (t.isCreatingSlaveProcess()) {
+//
+//                    } else {
+                        r.add(new NodeProvisioner.PlannedNode(t.getDisplayName(), Computer.threadPoolForRemoting
                                 .submit(new ProvisioningCallback(this, t, label)), 1));
+//                    }
                 }
-                if (r.size() > 0) {
-                    // Already found a matching template
+                if (shouldAddAtLeastOneSlave) {
                     return r;
                 }
             }
@@ -541,7 +552,7 @@ public class KubernetesCloud extends Cloud {
         }
 
         public Node call() throws Exception {
-            KubernetesSlave slave = null;
+            Slave slave = null;
             RetentionStrategy retentionStrategy = null;
             try {
                 if (t.getIdleMinutes() == 0) {
@@ -549,10 +560,13 @@ public class KubernetesCloud extends Cloud {
                 } else {
                     retentionStrategy = new CloudRetentionStrategy(t.getIdleMinutes());
                 }
-                slave = new KubernetesSlave(t, t.getName(), cloud.name, t.getLabel(), retentionStrategy);
-                Jenkins.getActiveInstance().addNode(slave);
+                if (!t.isCreatingSlaveProcess()) {
+                    slave = new KubernetesSlave(t, t.getName(), cloud.name, t.getLabel(), retentionStrategy);
+                    Jenkins.getActiveInstance().addNode(slave);
+                }
 
-                Pod pod = getPodTemplate(slave, label);
+                String customSlaveName = UUID.randomUUID().toString();
+                Pod pod = getPodTemplate(slave == null ? customSlaveName : slave.getNodeName(), label);
                 // Why the hell doesn't createPod return a Pod object ?
                 pod = connect().pods().create(pod);
 
@@ -603,7 +617,7 @@ public class KubernetesCloud extends Cloud {
                     if (!allContainersAreReady) {
                         continue;
                     }
-                    
+
                     if (validStates.contains(pod.getStatus().getPhase())) {
                         break;
                     }
@@ -613,19 +627,45 @@ public class KubernetesCloud extends Cloud {
                     throw new IllegalStateException("Container is not running after " + j + " attempts: " + status);
                 }
 
-                // now wait for slave to be online
+                String slaveId = null;
+                // wait for slave to be connected
                 for (; i < j; i++) {
-                    if (slave.getComputer() == null) {
-                        throw new IllegalStateException("Node was deleted, computer is null");
-                    }
-                    if (slave.getComputer().isOnline()) {
+                    Optional<Node> kubeSlave = findKubeSlave(podId);
+                    if (kubeSlave.isPresent()) {
+                        slaveId = kubeSlave.get().getDisplayName();
                         break;
                     }
-                    LOGGER.log(Level.INFO, "Waiting for slave to connect ({1}/{2}): {0}", new Object[] { podId,
+                    LOGGER.log(Level.INFO, "pod {0} is not online yet", podId);
+                    Thread.sleep(1000);
+                }
+
+                // now wait for slave to be online
+
+                Jenkins jenkins = Jenkins.getInstance();
+                for (; i < j; i++) {
+                    Node podIdNode = jenkins.getNode(slaveId);
+                    LOGGER.log(Level.INFO, "podIdNode is {0}", podIdNode);
+
+                    if (slave == null) {
+                        slave = (Slave) podIdNode;
+                    }
+
+//                    if (slave.getComputer() == null) {
+//                        throw new IllegalStateException("Node was deleted, computer is null");
+//                    }
+                    if (slave.getComputer() != null && slave.getComputer().isOnline()) {
+                        LOGGER.log(Level.INFO, "slave computer is online", podIdNode);
+                        slave.setLabelString(slave.getLabelString() + " " + t.getLabel() + " " + "kubeslave");
+                        slave.getAssignedLabels();
+                        slave.setRetentionStrategy(new AutoCreatedSlaveRetentionStrategy(cloud.name, t.getIdleMinutes()));
+                        jenkins.updateNode(slave);
+                        break;
+                    }
+                    LOGGER.log(Level.INFO, "Waiting for slave to connect ({1}/{2}): {0}", new Object[] { slaveId,
                             i, j });
                     Thread.sleep(1000);
                 }
-                if (!slave.getComputer().isOnline()) {
+                if (slave.getComputer() == null || !slave.getComputer().isOnline()) {
                     throw new IllegalStateException("Slave is not connected after " + j + " attempts: " + status);
                 }
 
@@ -636,6 +676,21 @@ public class KubernetesCloud extends Cloud {
                 throw Throwables.propagate(ex);
             }
         }
+    }
+
+    private Optional<Node> findKubeSlave(String podId) {
+        Jenkins jenkins = Jenkins.getInstance();
+        return Iterables.tryFind(jenkins.getNodes(), new Predicate<Node>() {
+            @Override
+            public boolean apply(@Nullable Node node) {
+                if (node != null) {
+                    String displayName = node.getDisplayName();
+                    LOGGER.log(Level.INFO, "{0} starting with {1}?", new Object[]{displayName, podId});
+                    return displayName.startsWith(podId);
+                }
+                return false;
+            }
+        });
     }
 
     /**
